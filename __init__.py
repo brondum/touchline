@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from pytouchline_extended import PyTouchline
+from pytouchline_extended import PyTouchline, TouchlineError
 
 from homeassistant import config_entries
 from homeassistant.config_entries import ConfigEntry
@@ -10,6 +10,7 @@ from homeassistant.const import CONF_HOST, Platform
 from homeassistant.core import DOMAIN as HOMEASSISTANT_DOMAIN, HomeAssistant
 from homeassistant.data_entry_flow import FlowResultType
 from homeassistant.exceptions import ConfigEntryNotReady
+from homeassistant.helpers.httpx_client import get_async_client
 from homeassistant.helpers.issue_registry import IssueSeverity, async_create_issue
 from homeassistant.helpers.typing import ConfigType
 
@@ -72,13 +73,27 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Roth Touchline from a config entry."""
 
     host = entry.data[CONF_HOST]
-    _LOGGER.debug(
-        "Host: %s",
-        host,
-    )
+    _LOGGER.debug("Host: %s", host)
 
-    py_touchline = PyTouchline(url=host)
-    number_of_devices = await py_touchline.get_number_of_devices_async()
+    client = get_async_client(hass, verify_ssl=False)
+    py_touchline = PyTouchline(url=host, client=client)
+
+    try:
+        number_of_devices = await py_touchline.get_number_of_devices_async()
+        if not number_of_devices:
+            raise ConfigEntryNotReady(
+                f"No devices reported by Touchline controller at {host}"
+            )
+
+        devices: list[PyTouchline] = []
+        for device_id in range(number_of_devices):
+            device = PyTouchline(id=device_id, url=host, client=client)
+            await device.update_async()
+            devices.append(device)
+    except TouchlineError as err:
+        raise ConfigEntryNotReady(
+            f"Failed to connect to Touchline controller at {host}: {err}"
+        ) from err
 
     _LOGGER.debug(
         "Host: %s, Number of devices found: %s",
@@ -86,9 +101,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         number_of_devices,
     )
 
-    if not number_of_devices:
-        raise ConfigEntryNotReady
-    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = py_touchline
+    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = devices
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     entry.async_on_unload(entry.add_update_listener(_async_update_listener))
 

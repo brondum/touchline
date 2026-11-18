@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, NamedTuple
 
-from pytouchline_extended import PyTouchline
+from pytouchline_extended import PyTouchline, TouchlineError
 import voluptuous as vol
 
 from homeassistant.components.climate import (
@@ -16,6 +16,7 @@ from homeassistant.components.climate import (
 from homeassistant.config_entries import SOURCE_IMPORT, ConfigEntry
 from homeassistant.const import ATTR_TEMPERATURE, CONF_HOST, UnitOfTemperature
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
 import homeassistant.helpers.config_validation as cv
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
@@ -60,11 +61,10 @@ async def async_setup_platform(
         if entry.source == SOURCE_IMPORT:
             return
 
-    if CONF_HOST in config:
-        host = config[CONF_HOST]
+    host = config.get(CONF_HOST)
+    if host:
         _LOGGER.debug("Roth Touchline host: %s", host)
-
-    if not host:
+    else:
         _LOGGER.error("No Roth Touchline detected")
         return
 
@@ -77,35 +77,15 @@ async def async_setup_platform(
     )
 
 
-# This function sets up the Touchline device from the configuration entry.
 async def async_setup_entry(
     hass: HomeAssistant,
     config: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Set up the Touchline device from config entry."""
-    host = config.data[CONF_HOST]
-    _LOGGER.debug(
-        "Host: %s",
-        host,
-    )
-
-    # Create a new PyTouchline instance with the host as the IP address.
-    py_touchline = PyTouchline(url=host)
-
-    # Get the number of devices from the PyTouchline instance.
-    number_of_devices = await py_touchline.get_number_of_devices_async()
-    _LOGGER.debug(
-        "Number of devices found: %s",
-        number_of_devices,
-    )
-
-    devices = [
-        Touchline(PyTouchline(id=device_id, url=host))
-        for device_id in range(number_of_devices)
-    ]
-    # Add the devices to Home Assistant.
-    async_add_entities(devices, True)
+    py_touchline_devices: list[PyTouchline] = hass.data[DOMAIN][config.entry_id]
+    devices = [Touchline(device) for device in py_touchline_devices]
+    async_add_entities(devices)
 
 
 # This function sets up the platform.
@@ -137,9 +117,10 @@ class Touchline(ClimateEntity):
     )
     _attr_temperature_unit = UnitOfTemperature.CELSIUS
 
-    def __init__(self, touchline_thermostat):
+    def __init__(self, touchline_thermostat: PyTouchline) -> None:
         """Initialize the Touchline device."""
         self.unit = touchline_thermostat
+        self._attr_available = True
         self._attr_name = None
         self._device_id = None
         self._controller_id = None
@@ -149,25 +130,56 @@ class Touchline(ClimateEntity):
         self._current_operation_mode = None
         self._attr_preset_mode = None
         self._attr_preset_modes = list(PRESET_MODES)
+        self._update_from_unit()
 
-    async def async_update(self) -> None:
-        """Update thermostat attributes."""
-        await self.unit.update_async()
+    def _update_from_unit(self) -> None:
+        """Copy parsed attributes from the PyTouchline unit."""
         self._attr_name = self.unit.get_name()
         self._device_id = self.unit.get_device_id()
         self._controller_id = self.unit.get_controller_id()
-        self._attr_unique_id = self._controller_id + self._device_id
+        if self._controller_id is not None and self._device_id is not None:
+            self._attr_unique_id = self._controller_id + self._device_id
         self._attr_current_temperature = self.unit.get_current_temperature()
         self._attr_target_temperature = self.unit.get_target_temperature()
+        operation_mode = self.unit.get_operation_mode()
+        week_program = self.unit.get_week_program()
         self._attr_preset_mode = TOUCHLINE_HA_PRESETS.get(
-            (self.unit.get_operation_mode(), self.unit.get_week_program())
+            (operation_mode, week_program if week_program is not None else 0)
         )
+
+    async def async_update(self) -> None:
+        """Update thermostat attributes."""
+        try:
+            await self.unit.update_async()
+        except TouchlineError as err:
+            if self._attr_available:
+                _LOGGER.warning(
+                    "Touchline thermostat %s became unavailable: %s",
+                    self._attr_name or self.entity_id,
+                    err,
+                )
+            self._attr_available = False
+            return
+
+        if not self._attr_available:
+            _LOGGER.info(
+                "Touchline thermostat %s is available again",
+                self._attr_name or self.unit.get_name(),
+            )
+        self._attr_available = True
+        self._update_from_unit()
 
     async def async_set_preset_mode(self, preset_mode: str) -> None:
         """Set new target preset mode."""
         new_preset_mode = PRESET_MODES[preset_mode]
-        await self.unit.set_operation_mode_async(new_preset_mode.mode)
-        await self.unit.set_week_program_async(new_preset_mode.program)
+        try:
+            await self.unit.set_operation_mode_async(new_preset_mode.mode)
+            await self.unit.set_week_program_async(new_preset_mode.program)
+        except TouchlineError as err:
+            raise HomeAssistantError(
+                f"Failed to set preset mode for {self._attr_name}: {err}"
+            ) from err
+        self._attr_preset_mode = preset_mode
 
     def set_hvac_mode(self, hvac_mode: HVACMode) -> None:
         """Set new target hvac mode."""
@@ -175,6 +187,12 @@ class Touchline(ClimateEntity):
 
     async def async_set_temperature(self, **kwargs: Any) -> None:
         """Set new target temperature."""
-        if kwargs.get(ATTR_TEMPERATURE) is not None:
-            self._attr_target_temperature = kwargs.get(ATTR_TEMPERATURE)
-        await self.unit.set_target_temperature_async(self._attr_target_temperature)
+        if (temperature := kwargs.get(ATTR_TEMPERATURE)) is None:
+            return
+        try:
+            await self.unit.set_target_temperature_async(temperature)
+        except TouchlineError as err:
+            raise HomeAssistantError(
+                f"Failed to set target temperature for {self._attr_name}: {err}"
+            ) from err
+        self._attr_target_temperature = temperature

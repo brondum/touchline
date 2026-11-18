@@ -5,12 +5,14 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from pytouchline_extended import PyTouchline
+from pytouchline_extended import PyTouchline, TouchlineError
 import voluptuous as vol
 
 from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
 from homeassistant.const import CONF_HOST
+from homeassistant.core import HomeAssistant
 import homeassistant.helpers.config_validation as cv
+from homeassistant.helpers.httpx_client import get_async_client
 
 from .const import _LOGGER, DOMAIN
 
@@ -24,21 +26,24 @@ RESULT_SUCCESS = "success"
 RESULT_CANNOT_CONNECT = "cannot_connect"
 
 
-async def _async_try_connect_and_fetch_basic_info(host):
+async def _async_try_connect_and_fetch_basic_info(
+    hass: HomeAssistant, host: str
+) -> dict[str, Any]:
     """Attempt to connect and, if successful, fetch number of devices."""
-    py_touchline = PyTouchline(url=host)
-    result = {"type": None, "data": {}}
+    client = get_async_client(hass, verify_ssl=False)
+    py_touchline = PyTouchline(url=host, client=client)
+    result: dict[str, Any] = {"type": None, "data": {}}
     number_of_devices = None
-    device = PyTouchline(id=0, url=host)
+    device = PyTouchline(id=0, url=host, client=client)
     try:
         number_of_devices = await py_touchline.get_number_of_devices_async()
         if number_of_devices:
             await device.update_async()
             result["data"] = device.get_controller_id()
-            if result["data"]:
+            if result["data"] is not None:
                 result["type"] = RESULT_SUCCESS
             return result
-    except Exception as e:
+    except TouchlineError as e:
         _LOGGER.debug(
             "Failed to connect to device %s: %s. Check the IP address "
             "as well as whether the device is connected to power and network",
@@ -77,25 +82,19 @@ class TouchlineConfigFlow(ConfigFlow, domain=DOMAIN):
                     step_id="user", data_schema=DATA_SCHEMA, errors=errors
                 )
 
-            try:
-                result = await _async_try_connect_and_fetch_basic_info(
-                    user_input[CONF_HOST]
-                )
-            except Exception as e:  # pylint: disable=broad-except
-                _LOGGER.error("Failed to connect: %s", e)
-                errors["base"] = "cannot_connect"
+            result = await _async_try_connect_and_fetch_basic_info(
+                self.hass, user_input[CONF_HOST]
+            )
 
             if result["type"] != RESULT_SUCCESS:
                 errors["base"] = "cannot_connect"
-
-            await self.async_set_unique_id(result["data"])
-            self._abort_if_unique_id_configured()
-            _LOGGER.debug(
-                "Host: %s",
-                user_input[CONF_HOST],
-            )
-            if not errors:
-                return self.async_create_entry(title=user_input[CONF_HOST], data=user_input)
+            else:
+                await self.async_set_unique_id(result["data"])
+                self._abort_if_unique_id_configured()
+                _LOGGER.debug("Host: %s", user_input[CONF_HOST])
+                return self.async_create_entry(
+                    title=user_input[CONF_HOST], data=user_input
+                )
         
         return self.async_show_form(
             step_id="user", 
@@ -105,17 +104,15 @@ class TouchlineConfigFlow(ConfigFlow, domain=DOMAIN):
 
     async def async_step_import(self, user_input: dict[str, Any]) -> ConfigFlowResult:
         """Import a configuration from yaml configuration."""
-        try:
-            result = await _async_try_connect_and_fetch_basic_info(
-                user_input[CONF_HOST]
-            )
-        except Exception as e:  # pylint: disable=broad-except
-            _LOGGER.error("Failed to connect: %s", e)
-            return self.async_abort(reason="cannot_connect")
+        result = await _async_try_connect_and_fetch_basic_info(
+            self.hass, user_input[CONF_HOST]
+        )
 
         if result["type"] != RESULT_SUCCESS:
             return self.async_abort(reason="cannot_connect")
-        
+
+        await self.async_set_unique_id(result["data"])
+        self._abort_if_unique_id_configured()
         return self.async_create_entry(title=user_input[CONF_HOST], data=user_input)
 
     def _validate_input(self, user_input: dict[str, Any]) -> dict[str, str]:
