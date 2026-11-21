@@ -1,20 +1,83 @@
 {
-    "config": {
-        "abort": {
-            "already_configured": "Device is already configured"
-        },
-        "error": {
-            "cannot_connect": "Failed to connect",
-            "invalid_input": "Invalid hostname or IP address"
-        },
-        "step": {
-            "user": {
-                "data": {
-                    "ip_address": "IP address"
-                },
-                "description": "Provide the URL of the device",
-                "title": "Identify the device"
-            }
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connect to Roth Touchline controller",
+        "description": "Enter the IP address or URL of the Roth Touchline controller.",
+        "data": {
+          "host": "Host"
         }
+      },
+      "reconfigure": {
+        "title": "Reconfigure Roth Touchline controller",
+        "description": "Update the IP address or URL of this Roth Touchline controller.",
+        "data": {
+          "host": "Host"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Failed to connect",
+      "invalid_input": "Invalid hostname or IP address"
+    },
+    "abort": {
+      "already_configured": "Device is already configured",
+      "cannot_connect": "Failed to connect",
+      "invalid_input": "Invalid hostname or IP address",
+      "reconfigure_successful": "Re-configuration was successful",
+      "wrong_device": "The controller at that address belongs to a different configured Touchline unit."
     }
+  },
+  "entity": {
+    "binary_sensor": {
+      "problem": {
+        "name": "Controller problem"
+      },
+      "rf_communication_problem": {
+        "name": "RF communication"
+      },
+      "safety_tripped": {
+        "name": "Supply water safety limit"
+      },
+      "dew_point_active": {
+        "name": "Dew point limit"
+      },
+      "week_program_warning": {
+        "name": "Schedule clock warning"
+      }
+    },
+    "sensor": {
+      "error_code": {
+        "name": "Error code",
+        "state": {
+          "no_error": "No error",
+          "high_limit_dew_point": "High limit dew point",
+          "high_limit_supply_water": "High limit supply water",
+          "rf_communication_interrupted": "RF communication interrupted (check room units)",
+          "unknown": "Unknown error"
+        }
+      },
+      "room_temperature": {
+        "name": "Temperature"
+      }
+    },
+    "select": {
+      "controller_operation_mode": {
+        "name": "Operating mode",
+        "state": {
+          "day": "Day",
+          "night": "Night",
+          "off_holiday": "Off / Holiday"
+        }
+      }
+    },
+    "number": {
+      "min_temperature": {
+        "name": "Minimum setpoint"
+      },
+      "max_temperature": {
+        "name": "Maximum setpoint"
+      }
+    }
+  }
 }

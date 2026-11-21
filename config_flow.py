@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from pytouchline_extended import PyTouchline, TouchlineError
+from pytouchline_extended import TouchlineController, TouchlineError, TouchlineState
 import voluptuous as vol
 
 from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
@@ -16,46 +16,27 @@ from homeassistant.helpers.httpx_client import get_async_client
 
 from .const import _LOGGER, DOMAIN
 
-DATA_SCHEMA = vol.Schema(
-    {
-        vol.Required(CONF_HOST): str,
-    }
-)
 
-RESULT_SUCCESS = "success"
-RESULT_CANNOT_CONNECT = "cannot_connect"
+def _build_schema(default_host: str | None = None) -> vol.Schema:
+    """Build the config/reconfigure schema for the controller URL."""
+    if default_host:
+        return vol.Schema({vol.Required(CONF_HOST, default=default_host): str})
+    return vol.Schema({vol.Required(CONF_HOST): str})
 
 
-async def _async_try_connect_and_fetch_basic_info(
+def _normalize_host(raw_host: str) -> str:
+    """Normalize a user-provided IP/hostname/URL into ``http://<host>``."""
+    cleaned = re.sub(r"^https?://", "", raw_host.strip()).rstrip("/")
+    return f"http://{cleaned}"
+
+
+async def _async_fetch_controller_state(
     hass: HomeAssistant, host: str
-) -> dict[str, Any]:
-    """Attempt to connect and, if successful, fetch number of devices."""
+) -> TouchlineState:
+    """Connect to the Touchline controller and fetch its full initial snapshot."""
     client = get_async_client(hass, verify_ssl=False)
-    py_touchline = PyTouchline(url=host, client=client)
-    result: dict[str, Any] = {"type": None, "data": {}}
-    number_of_devices = None
-    device = PyTouchline(id=0, url=host, client=client)
-    try:
-        number_of_devices = await py_touchline.get_number_of_devices_async()
-        if number_of_devices:
-            await device.update_async()
-            result["data"] = device.get_controller_id()
-            if result["data"] is not None:
-                result["type"] = RESULT_SUCCESS
-            return result
-    except TouchlineError as e:
-        _LOGGER.debug(
-            "Failed to connect to device %s: %s. Check the IP address "
-            "as well as whether the device is connected to power and network",
-            host,
-            e,
-        )
-        result["type"] = RESULT_CANNOT_CONNECT
-    _LOGGER.debug(
-        "Number of devices found: %s",
-        number_of_devices,
-    )
-    return result
+    controller = TouchlineController(url=host, client=client)
+    return await controller.fetch_async()
 
 
 class TouchlineConfigFlow(ConfigFlow, domain=DOMAIN):
@@ -63,69 +44,154 @@ class TouchlineConfigFlow(ConfigFlow, domain=DOMAIN):
 
     VERSION = 1
 
+    def _entry_matches_controller(
+        self,
+        state: TouchlineState,
+        *,
+        exclude_entry_id: str | None = None,
+    ) -> bool:
+        """Check whether an existing entry already represents the same physical controller."""
+        ctrl = state.controller
+        candidate_ids = {
+            str(val)
+            for val in (ctrl.unique_id, ctrl.controller_id)
+            if val is not None and str(val) != ""
+        }
+        if not candidate_ids:
+            return False
+
+        for entry in self._async_current_entries():
+            if exclude_entry_id and entry.entry_id == exclude_entry_id:
+                continue
+            if entry.unique_id is not None and str(entry.unique_id) in candidate_ids:
+                return True
+        return False
+
+    def _validate_host(self, user_input: dict[str, Any]) -> dict[str, str]:
+        """Normalize and validate the controller host URL."""
+        host = _normalize_host(user_input[CONF_HOST])
+        user_input[CONF_HOST] = host
+        try:
+            cv.url(host)
+        except vol.Invalid:
+            return {"base": "invalid_input"}
+        return {}
+
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
         """Handle a flow initialized by the user."""
-
-        errors = {}
-        result = {"type": None, "data": {}}
+        errors: dict[str, str] = {}
 
         if user_input is not None:
+            errors = self._validate_host(user_input)
+            if not errors:
+                host = user_input[CONF_HOST]
+                self._async_abort_entries_match({CONF_HOST: host})
 
-            # Abort if an entry with same host is present.
-            self._async_abort_entries_match({CONF_HOST: user_input[CONF_HOST]})
+                try:
+                    state = await _async_fetch_controller_state(self.hass, host)
+                except TouchlineError as err:
+                    _LOGGER.debug(
+                        "Failed to connect to Touchline controller at %s: %s",
+                        host,
+                        err,
+                    )
+                    errors["base"] = "cannot_connect"
+                else:
+                    if self._entry_matches_controller(state):
+                        return self.async_abort(reason="already_configured")
 
-            errors = self._validate_input(user_input)
-            if errors:
-                return self.async_show_form(
-                    step_id="user", data_schema=DATA_SCHEMA, errors=errors
-                )
+                    ctrl = state.controller
+                    unique_id = ctrl.unique_id or (
+                        str(ctrl.controller_id)
+                        if ctrl.controller_id is not None
+                        else None
+                    )
+                    if unique_id is not None:
+                        await self.async_set_unique_id(unique_id)
+                        self._abort_if_unique_id_configured()
 
-            result = await _async_try_connect_and_fetch_basic_info(
-                self.hass, user_input[CONF_HOST]
-            )
+                    title = ctrl.hostname or host
+                    return self.async_create_entry(title=title, data=user_input)
 
-            if result["type"] != RESULT_SUCCESS:
-                errors["base"] = "cannot_connect"
-            else:
-                await self.async_set_unique_id(result["data"])
-                self._abort_if_unique_id_configured()
-                _LOGGER.debug("Host: %s", user_input[CONF_HOST])
-                return self.async_create_entry(
-                    title=user_input[CONF_HOST], data=user_input
-                )
-        
         return self.async_show_form(
-            step_id="user", 
-            data_schema=DATA_SCHEMA,
-            errors = errors,
+            step_id="user",
+            data_schema=_build_schema(
+                user_input.get(CONF_HOST) if user_input else None
+            ),
+            errors=errors,
+        )
+
+    async def async_step_reconfigure(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Handle reconfiguring the controller host/IP address."""
+        reconfigure_entry = self._get_reconfigure_entry()
+        errors: dict[str, str] = {}
+
+        if user_input is not None:
+            errors = self._validate_host(user_input)
+            if not errors:
+                host = user_input[CONF_HOST]
+                for entry in self._async_current_entries():
+                    if (
+                        entry.entry_id != reconfigure_entry.entry_id
+                        and entry.data.get(CONF_HOST) == host
+                    ):
+                        return self.async_abort(reason="already_configured")
+
+                try:
+                    state = await _async_fetch_controller_state(self.hass, host)
+                except TouchlineError as err:
+                    _LOGGER.debug(
+                        "Failed to connect to Touchline controller at %s: %s",
+                        host,
+                        err,
+                    )
+                    errors["base"] = "cannot_connect"
+                else:
+                    if self._entry_matches_controller(
+                        state, exclude_entry_id=reconfigure_entry.entry_id
+                    ):
+                        return self.async_abort(reason="wrong_device")
+
+                    return self.async_update_reload_and_abort(
+                        reconfigure_entry,
+                        data_updates={CONF_HOST: host},
+                    )
+
+        return self.async_show_form(
+            step_id="reconfigure",
+            data_schema=_build_schema(reconfigure_entry.data.get(CONF_HOST)),
+            errors=errors,
         )
 
     async def async_step_import(self, user_input: dict[str, Any]) -> ConfigFlowResult:
-        """Import a configuration from yaml configuration."""
-        result = await _async_try_connect_and_fetch_basic_info(
-            self.hass, user_input[CONF_HOST]
-        )
+        """Import a configuration from configuration.yaml."""
+        if self._validate_host(user_input):
+            return self.async_abort(reason="invalid_input")
 
-        if result["type"] != RESULT_SUCCESS:
+        host = user_input[CONF_HOST]
+        self._async_abort_entries_match({CONF_HOST: host})
+
+        try:
+            state = await _async_fetch_controller_state(self.hass, host)
+        except TouchlineError:
             return self.async_abort(reason="cannot_connect")
 
-        await self.async_set_unique_id(result["data"])
-        self._abort_if_unique_id_configured()
-        return self.async_create_entry(title=user_input[CONF_HOST], data=user_input)
+        if self._entry_matches_controller(state):
+            return self.async_abort(reason="already_configured")
 
-    def _validate_input(self, user_input: dict[str, Any]) -> dict[str, str]:
-        """Validate the user input."""
-        errors = {}
-        host = user_input[CONF_HOST]
-        # Remove HTTPS and HTTP schema from URL.
-        pattern = "https?://"
-        host = re.sub(pattern, "", host)
-        host = "http://" + host
-        user_input[CONF_HOST] = host
-        if not cv.url(host):
-            errors["base"] = "invalid_input"
-        else:
-            self._async_abort_entries_match({CONF_HOST: user_input[CONF_HOST]})
-        return errors
+        ctrl = state.controller
+        unique_id = ctrl.unique_id or (
+            str(ctrl.controller_id) if ctrl.controller_id is not None else None
+        )
+        if unique_id is not None:
+            await self.async_set_unique_id(unique_id)
+            self._abort_if_unique_id_configured()
+
+        return self.async_create_entry(
+            title=ctrl.hostname or host,
+            data={CONF_HOST: host},
+        )
